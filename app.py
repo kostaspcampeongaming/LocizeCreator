@@ -1,4 +1,3 @@
-import time
 import streamlit as st
 import pandas as pd
 import psycopg
@@ -6,6 +5,7 @@ from psycopg.rows import dict_row
 import io
 from pathlib import Path
 from datetime import datetime, timezone
+import time
 
 # =========================================================
 # CONFIG: your vault locale order (deduped, preserved order)
@@ -29,8 +29,9 @@ LOCALES = dedupe_preserve_order(RAW_LOCALES)
 BASE_COLS = ["key", "tags", "context", "maxCharacters", "namespace"]
 EXPECTED_HEADERS = BASE_COLS + LOCALES
 
+
 # =========================================================
-# DB helpers
+# DB
 # =========================================================
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
@@ -44,7 +45,7 @@ def get_conn():
         raise RuntimeError("Missing DATABASE_URL. Add it to Streamlit Secrets or .streamlit/secrets.toml")
 
     conn = psycopg.connect(db_url, row_factory=dict_row)
-    # IMPORTANT: avoid implicit long transactions during Streamlit reruns
+    # Prevent long implicit transactions during Streamlit reruns (multi-user safe)
     conn.autocommit = True
     return conn
 
@@ -52,7 +53,7 @@ def df_from_query(conn, sql: str, params=None) -> pd.DataFrame:
     params = params or ()
     with conn.cursor() as cur:
         cur.execute(sql, params)
-        rows = cur.fetchall()  # list[dict] because row_factory=dict_row
+        rows = cur.fetchall()  # list[dict] due to dict_row
     return pd.DataFrame(rows)
 
 def init_db(conn):
@@ -96,11 +97,12 @@ def init_db(conn):
         """)
 
 def reset_db(conn):
-    # Safer on shared Postgres than DROP TABLE (avoids DDL locks)
+    """
+    Force clean sweep (data-only) WITHOUT dropping tables.
+    Much safer under concurrency than DROP TABLE.
+    """
+    init_db(conn)
     with conn.cursor() as cur:
-        # If tables are empty/nonexistent, init_db ensures they exist before this is called in UI flow,
-        # but TRUNCATE will fail if tables don't exist, so ensure schema first.
-        init_db(conn)
         cur.execute("TRUNCATE TABLE conflicts, translations, entries, meta;")
 
 def set_meta(conn, k, v):
@@ -143,11 +145,7 @@ def get_translation(conn, key, locale):
 
 def list_keys(conn, contains=""):
     if contains.strip():
-        df = df_from_query(
-            conn,
-            "SELECT key FROM entries WHERE key ILIKE %s ORDER BY key",
-            (f"%{contains}%",)
-        )
+        df = df_from_query(conn, "SELECT key FROM entries WHERE key ILIKE %s ORDER BY key", (f"%{contains}%",))
     else:
         df = df_from_query(conn, "SELECT key FROM entries ORDER BY key")
 
@@ -179,9 +177,6 @@ def resolve_conflict(conn, key, locale, resolved_value, who):
         """, (resolved_value, who, now_utc_dt(), key, locale))
     set_translation(conn, key, locale, resolved_value, who=who)
 
-# =========================================================
-# XLSX merge / bootstrap
-# =========================================================
 def read_locize_xlsx(file_bytes: bytes, source_name: str):
     df = pd.read_excel(io.BytesIO(file_bytes), dtype=str).fillna("")
 
@@ -201,7 +196,7 @@ def read_locize_xlsx(file_bytes: bytes, source_name: str):
     return df
 
 def bootstrap_from_files(conn, dfs_with_source, who="bootstrap"):
-    # Clear conflicts fresh
+    # Clear conflicts
     with conn.cursor() as cur:
         cur.execute("TRUNCATE TABLE conflicts;")
 
@@ -212,7 +207,8 @@ def bootstrap_from_files(conn, dfs_with_source, who="bootstrap"):
         for _, row in df.iterrows():
             key = row["key"]
             upsert_entry(
-                conn, key,
+                conn,
+                key,
                 tags=row.get("tags", ""),
                 context=row.get("context", ""),
                 maxCharacters=row.get("maxCharacters", ""),
@@ -222,7 +218,6 @@ def bootstrap_from_files(conn, dfs_with_source, who="bootstrap"):
             for loc in LOCALES:
                 incoming = str(row.get(loc, "") or "")
 
-                # does row exist?
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT 1 AS one FROM translations WHERE key=%s AND locale=%s",
@@ -248,9 +243,6 @@ def bootstrap_from_files(conn, dfs_with_source, who="bootstrap"):
         "conflicts_detected": total_conflicts
     }
 
-# =========================================================
-# Export
-# =========================================================
 def build_export_df(conn, selected_locales, fill_missing_with_en=False):
     keys = list_keys(conn)
     rows = []
@@ -308,6 +300,7 @@ def keys_with_empty_en(conn):
         return []
     return df["key"].tolist()
 
+
 # =========================================================
 # UI
 # =========================================================
@@ -318,6 +311,7 @@ st.sidebar.markdown("### Database (Postgres)")
 conn = get_conn()
 init_db(conn)
 
+# Health counters
 with conn.cursor() as cur:
     cur.execute("SELECT COUNT(*) AS c FROM entries")
     entry_count = cur.fetchone()["c"]
@@ -343,17 +337,13 @@ tab_boot, tab_missing, tab_conf, tab_dict, tab_export = st.tabs(
 # Bootstrap
 # -----------------------------
 with tab_boot:
-    st.subheader("Bootstrap database from 3 XLSX files (one-time or when resetting)")
-    st.write("This replaces the DB content and rebuilds from the selected XLSX files. Empty translations are kept.")
+    st.subheader("Bootstrap database from 3 XLSX files")
+    st.write("This resets DB tables (TRUNCATE) and rebuilds from uploaded XLSX. Empty translations are kept.")
 
     who = st.text_input("Your name (audit)", value="web-content")
 
     st.markdown("#### Option A: Upload the 3 XLSX (recommended)")
-    up_files = st.file_uploader(
-        "Upload 3 XLSX files",
-        type=["xlsx"],
-        accept_multiple_files=True
-    )
+    up_files = st.file_uploader("Upload 3 XLSX files", type=["xlsx"], accept_multiple_files=True)
 
     st.markdown("#### Option B: Load from disk (same folder as app.py)")
     if "disk_files" not in st.session_state:
@@ -371,55 +361,54 @@ with tab_boot:
             st.success("Loaded 3 files from disk (saved in session).")
 
     st.markdown("---")
-    st.warning("This action will RESET the DB content in Postgres.")
+    st.warning("This action will RESET the DB content in Postgres (TRUNCATE).")
 
     if st.button("Build / Reset DB now"):
-    t0 = time.time()
-    status = st.status("Bootstrapping…", expanded=True)
+        t0 = time.time()
+        status = st.status("Bootstrapping…", expanded=True)
+        try:
+            status.write("Step 1: DB ping")
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 AS ok;")
+                ok = cur.fetchone()["ok"]
+            status.write(f"DB ping ok: {ok} (t={time.time()-t0:.2f}s)")
 
-    try:
-        status.write("Step 1: DB ping")
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 AS ok;")
-            ok = cur.fetchone()["ok"]
-        status.write(f"DB ping ok: {ok} (t={time.time()-t0:.2f}s)")
+            status.write("Step 2: Read XLSX files")
+            dfs = []
 
-        status.write("Step 2: Read XLSX files")
-        dfs = []
+            if up_files:
+                for f in up_files:
+                    status.write(f"Reading: {f.name}")
+                    df = read_locize_xlsx(f.getvalue(), f.name)
+                    status.write(f"  rows={len(df)} cols={len(df.columns)}")
+                    dfs.append((df, f.name))
 
-        if up_files and len(up_files) > 0:
-            for f in up_files:
-                status.write(f"Reading: {f.name}")
-                df = read_locize_xlsx(f.getvalue(), f.name)
-                status.write(f"  rows={len(df)} cols={len(df.columns)}")
-                dfs.append((df, f.name))
+            if st.session_state.get("disk_files"):
+                for n, b in st.session_state["disk_files"]:
+                    status.write(f"Reading: {n}")
+                    df = read_locize_xlsx(b, n)
+                    status.write(f"  rows={len(df)} cols={len(df.columns)}")
+                    dfs.append((df, n))
 
-        if st.session_state.get("disk_files"):
-            for n, b in st.session_state["disk_files"]:
-                status.write(f"Reading: {n}")
-                df = read_locize_xlsx(b, n)
-                status.write(f"  rows={len(df)} cols={len(df.columns)}")
-                dfs.append((df, n))
+            if len(dfs) == 0:
+                status.update(label="No files provided", state="error")
+                st.error("No files provided. Upload the 3 XLSX or load from disk.")
+                st.stop()
 
-        if len(dfs) == 0:
-            status.update(label="No files provided", state="error")
-            st.error("No files provided. Upload the 3 XLSX or load from disk.")
-            st.stop()
+            status.write("Step 3: Force clean sweep (TRUNCATE)")
+            reset_db(conn)
+            status.write(f"Reset done (t={time.time()-t0:.2f}s)")
 
-        status.write("Step 3: Reset DB (TRUNCATE)")
-        reset_db(conn)
-        status.write(f"Reset done (t={time.time()-t0:.2f}s)")
+            status.write("Step 4: Bootstrap merge/write")
+            stats = bootstrap_from_files(conn, dfs, who=who.strip() or "bootstrap")
+            status.write(stats)
 
-        status.write("Step 4: Bootstrap merge/write")
-        stats = bootstrap_from_files(conn, dfs, who=who.strip() or "bootstrap")
-        status.write(stats)
+            status.update(label="Bootstrap complete ✅", state="complete")
+            st.rerun()
 
-        status.update(label="Bootstrap complete ✅", state="complete")
-        st.rerun()
-
-    except Exception as e:
-        status.update(label="Bootstrap failed ❌", state="error")
-        st.exception(e)
+        except Exception as e:
+            status.update(label="Bootstrap failed ❌", state="error")
+            st.exception(e)
 
 # -----------------------------
 # Missing EN
@@ -454,10 +443,9 @@ with tab_missing:
 # -----------------------------
 with tab_conf:
     st.subheader("Conflicts (optional)")
-    st.write("Conflicts only appear if the same key+locale has different non-empty values across the bootstrap XLSX files.")
+    st.write("Conflicts appear only if the same key+locale has different non-empty values across bootstrap XLSX files.")
 
     conf = list_conflicts(conn)
-
     if conf.empty:
         st.info("No conflicts detected.")
     else:
@@ -477,7 +465,7 @@ with tab_conf:
 
             locales_for_key = open_conf[open_conf["key"] == pick_key]["locale"].tolist()
             if not locales_for_key:
-                st.warning("Stale selection (no locales left for this key). Click refresh.")
+                st.warning("Stale selection (no locales left). Click refresh.")
                 if st.button("Refresh selection"):
                     st.session_state.pop("conf_pick_key", None)
                     st.session_state.pop("conf_pick_locale", None)
@@ -487,10 +475,10 @@ with tab_conf:
                     st.session_state["conf_pick_locale"] = locales_for_key[0]
 
                 pick_locale = st.selectbox("Pick locale", options=locales_for_key, key="conf_pick_locale")
-
                 match = open_conf[(open_conf["key"] == pick_key) & (open_conf["locale"] == pick_locale)]
+
                 if match.empty:
-                    st.warning("This conflict is already resolved or selection is stale. Click refresh.")
+                    st.warning("Already resolved or stale. Click refresh.")
                     if st.button("Refresh selection", key="refresh2"):
                         st.session_state.pop("conf_pick_key", None)
                         st.session_state.pop("conf_pick_locale", None)
@@ -506,7 +494,6 @@ with tab_conf:
 
                     choice = st.radio("Choose base", options=["Use A", "Use B", "Custom"], index=0)
                     initial = a_val if choice == "Use A" else b_val if choice == "Use B" else ""
-
                     final = st.text_area("Resolved value (editable)", value=initial, height=120)
                     who3 = st.text_input("Resolved by", value="web-content", key="conf_who")
 
@@ -525,7 +512,7 @@ with tab_dict:
     st.write(f"Keys: {len(keys)}")
 
     if not keys:
-        st.info("No keys yet. Bootstrap the DB first.")
+        st.info("No keys yet. Bootstrap first.")
     else:
         selected_key = st.selectbox("Select key", options=keys[:5000])
         st.write(f"Key: `{selected_key}`")
@@ -582,7 +569,7 @@ with tab_export:
         conf_df = list_conflicts(conn)
         open_conf = conf_df[conf_df["resolved_value"].isna()] if not conf_df.empty else conf_df
         if not open_conf.empty:
-            st.warning(f"There are {len(open_conf)} unresolved conflicts. Export will include current DB values.")
+            st.warning(f"There are {len(open_conf)} unresolved conflicts.")
             st.dataframe(open_conf.head(50), width="stretch")
 
         st.dataframe(df.head(50), width="stretch")
@@ -602,6 +589,3 @@ with tab_export:
             file_name=fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-
-
-
