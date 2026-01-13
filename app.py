@@ -1,6 +1,8 @@
+import time
 import streamlit as st
 import pandas as pd
-import sqlite3
+import psycopg
+from psycopg.rows import dict_row
 import io
 from pathlib import Path
 from datetime import datetime, timezone
@@ -28,136 +30,154 @@ BASE_COLS = ["key", "tags", "context", "maxCharacters", "namespace"]
 EXPECTED_HEADERS = BASE_COLS + LOCALES
 
 # =========================================================
-# DB
+# DB helpers
 # =========================================================
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
-def get_conn(db_path: str):
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON;")
+def now_utc_dt():
+    return datetime.now(timezone.utc)
+
+def get_conn():
+    db_url = st.secrets.get("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("Missing DATABASE_URL. Add it to Streamlit Secrets or .streamlit/secrets.toml")
+
+    conn = psycopg.connect(db_url, row_factory=dict_row)
+    # IMPORTANT: avoid implicit long transactions during Streamlit reruns
+    conn.autocommit = True
     return conn
 
-def init_db(conn: sqlite3.Connection):
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS entries (
-        key TEXT PRIMARY KEY,
-        tags TEXT NOT NULL DEFAULT '',
-        context TEXT NOT NULL DEFAULT '',
-        maxCharacters TEXT NOT NULL DEFAULT '',
-        namespace TEXT NOT NULL DEFAULT 'translation',
-        created_at TEXT NOT NULL
-    );
+def df_from_query(conn, sql: str, params=None) -> pd.DataFrame:
+    params = params or ()
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()  # list[dict] because row_factory=dict_row
+    return pd.DataFrame(rows)
 
-    CREATE TABLE IF NOT EXISTS translations (
-        key TEXT NOT NULL,
-        locale TEXT NOT NULL,
-        value TEXT NOT NULL DEFAULT '',
-        updated_at TEXT NOT NULL,
-        updated_by TEXT NOT NULL DEFAULT 'system',
-        PRIMARY KEY (key, locale),
-        FOREIGN KEY (key) REFERENCES entries(key) ON DELETE CASCADE
-    );
+def init_db(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS entries (
+            key TEXT PRIMARY KEY,
+            tags TEXT NOT NULL DEFAULT '',
+            context TEXT NOT NULL DEFAULT '',
+            maxCharacters TEXT NOT NULL DEFAULT '',
+            namespace TEXT NOT NULL DEFAULT 'translation',
+            created_at TIMESTAMPTZ NOT NULL
+        );
 
-    CREATE TABLE IF NOT EXISTS conflicts (
-        key TEXT NOT NULL,
-        locale TEXT NOT NULL,
-        a_value TEXT NOT NULL,
-        a_source TEXT NOT NULL,
-        b_value TEXT NOT NULL,
-        b_source TEXT NOT NULL,
-        resolved_value TEXT,
-        resolved_by TEXT,
-        resolved_at TEXT,
-        PRIMARY KEY (key, locale),
-        FOREIGN KEY (key) REFERENCES entries(key) ON DELETE CASCADE
-    );
+        CREATE TABLE IF NOT EXISTS translations (
+            key TEXT NOT NULL REFERENCES entries(key) ON DELETE CASCADE,
+            locale TEXT NOT NULL,
+            value TEXT NOT NULL DEFAULT '',
+            updated_at TIMESTAMPTZ NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT 'system',
+            PRIMARY KEY (key, locale)
+        );
 
-    CREATE TABLE IF NOT EXISTS meta (
-        k TEXT PRIMARY KEY,
-        v TEXT NOT NULL
-    );
-    """)
-    conn.commit()
+        CREATE TABLE IF NOT EXISTS conflicts (
+            key TEXT NOT NULL REFERENCES entries(key) ON DELETE CASCADE,
+            locale TEXT NOT NULL,
+            a_value TEXT NOT NULL,
+            a_source TEXT NOT NULL,
+            b_value TEXT NOT NULL,
+            b_source TEXT NOT NULL,
+            resolved_value TEXT,
+            resolved_by TEXT,
+            resolved_at TIMESTAMPTZ,
+            PRIMARY KEY (key, locale)
+        );
 
-def reset_db(conn: sqlite3.Connection):
-    conn.executescript("""
-    DROP TABLE IF EXISTS conflicts;
-    DROP TABLE IF EXISTS translations;
-    DROP TABLE IF EXISTS entries;
-    DROP TABLE IF EXISTS meta;
-    """)
-    conn.commit()
-    init_db(conn)
+        CREATE TABLE IF NOT EXISTS meta (
+            k TEXT PRIMARY KEY,
+            v TEXT NOT NULL
+        );
+        """)
+
+def reset_db(conn):
+    # Safer on shared Postgres than DROP TABLE (avoids DDL locks)
+    with conn.cursor() as cur:
+        # If tables are empty/nonexistent, init_db ensures they exist before this is called in UI flow,
+        # but TRUNCATE will fail if tables don't exist, so ensure schema first.
+        init_db(conn)
+        cur.execute("TRUNCATE TABLE conflicts, translations, entries, meta;")
 
 def set_meta(conn, k, v):
-    conn.execute(
-        "INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-        (k, v)
-    )
-    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO meta(k, v) VALUES (%s, %s)
+            ON CONFLICT(k) DO UPDATE SET v = EXCLUDED.v
+        """, (k, v))
 
 def get_meta(conn, k, default=None):
-    row = conn.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
-    return row[0] if row else default
+    with conn.cursor() as cur:
+        cur.execute("SELECT v FROM meta WHERE k=%s", (k,))
+        row = cur.fetchone()
+    return row["v"] if row else default
 
 def upsert_entry(conn, key, tags="", context="", maxCharacters="", namespace="translation"):
-    conn.execute("""
-        INSERT INTO entries(key, tags, context, maxCharacters, namespace, created_at)
-        VALUES (?,?,?,?,?,?)
-        ON CONFLICT(key) DO NOTHING
-    """, (key, tags or "", context or "", maxCharacters or "", namespace or "translation", utc_now()))
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO entries(key, tags, context, maxCharacters, namespace, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT(key) DO NOTHING
+        """, (key, tags or "", context or "", maxCharacters or "", namespace or "translation", now_utc_dt()))
 
 def set_translation(conn, key, locale, value, who="system"):
-    conn.execute("""
-        INSERT INTO translations(key, locale, value, updated_at, updated_by)
-        VALUES (?,?,?,?,?)
-        ON CONFLICT(key, locale) DO UPDATE SET
-          value=excluded.value,
-          updated_at=excluded.updated_at,
-          updated_by=excluded.updated_by
-    """, (key, locale, value if value is not None else "", utc_now(), who))
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO translations(key, locale, value, updated_at, updated_by)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT(key, locale) DO UPDATE SET
+              value=EXCLUDED.value,
+              updated_at=EXCLUDED.updated_at,
+              updated_by=EXCLUDED.updated_by
+        """, (key, locale, value if value is not None else "", now_utc_dt(), who))
 
 def get_translation(conn, key, locale):
-    row = conn.execute(
-        "SELECT value FROM translations WHERE key=? AND locale=?",
-        (key, locale)
-    ).fetchone()
-    return row[0] if row else ""
+    with conn.cursor() as cur:
+        cur.execute("SELECT value FROM translations WHERE key=%s AND locale=%s", (key, locale))
+        row = cur.fetchone()
+    return row["value"] if row else ""
 
 def list_keys(conn, contains=""):
     if contains.strip():
-        df = pd.read_sql_query(
-            "SELECT key FROM entries WHERE key LIKE ? ORDER BY key",
+        df = df_from_query(
             conn,
-            params=(f"%{contains}%",)
+            "SELECT key FROM entries WHERE key ILIKE %s ORDER BY key",
+            (f"%{contains}%",)
         )
     else:
-        df = pd.read_sql_query("SELECT key FROM entries ORDER BY key", conn)
+        df = df_from_query(conn, "SELECT key FROM entries ORDER BY key")
+
+    if df.empty:
+        return []
     return df["key"].tolist()
 
 def list_conflicts(conn):
-    return pd.read_sql_query("""
+    return df_from_query(conn, """
         SELECT key, locale, a_source, a_value, b_source, b_value, resolved_value, resolved_by, resolved_at
         FROM conflicts
         ORDER BY key, locale
-    """, conn)
+    """)
 
 def upsert_conflict(conn, key, locale, a_value, a_source, b_value, b_source):
-    conn.execute("""
-        INSERT INTO conflicts(key, locale, a_value, a_source, b_value, b_source)
-        VALUES (?,?,?,?,?,?)
-        ON CONFLICT(key, locale) DO NOTHING
-    """, (key, locale, a_value, a_source, b_value, b_source))
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO conflicts(key, locale, a_value, a_source, b_value, b_source)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT(key, locale) DO NOTHING
+        """, (key, locale, a_value, a_source, b_value, b_source))
 
 def resolve_conflict(conn, key, locale, resolved_value, who):
-    conn.execute("""
-        UPDATE conflicts
-        SET resolved_value=?, resolved_by=?, resolved_at=?
-        WHERE key=? AND locale=?
-    """, (resolved_value, who, utc_now(), key, locale))
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE conflicts
+            SET resolved_value=%s, resolved_by=%s, resolved_at=%s
+            WHERE key=%s AND locale=%s
+        """, (resolved_value, who, now_utc_dt(), key, locale))
     set_translation(conn, key, locale, resolved_value, who=who)
-    conn.commit()
 
 # =========================================================
 # XLSX merge / bootstrap
@@ -181,8 +201,9 @@ def read_locize_xlsx(file_bytes: bytes, source_name: str):
     return df
 
 def bootstrap_from_files(conn, dfs_with_source, who="bootstrap"):
-    conn.execute("DELETE FROM conflicts;")
-    conn.commit()
+    # Clear conflicts fresh
+    with conn.cursor() as cur:
+        cur.execute("TRUNCATE TABLE conflicts;")
 
     total_cells_written = 0
     total_conflicts = 0
@@ -201,23 +222,22 @@ def bootstrap_from_files(conn, dfs_with_source, who="bootstrap"):
             for loc in LOCALES:
                 incoming = str(row.get(loc, "") or "")
 
-                # does a row exist at all?
-                exists_row = conn.execute(
-                    "SELECT 1 FROM translations WHERE key=? AND locale=?",
-                    (key, loc)
-                ).fetchone()
+                # does row exist?
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT 1 AS one FROM translations WHERE key=%s AND locale=%s",
+                        (key, loc)
+                    )
+                    exists_row = cur.fetchone()
 
                 if exists_row is None:
                     set_translation(conn, key, loc, incoming, who=who)
                     total_cells_written += 1
                 else:
                     existing = get_translation(conn, key, loc)
-                    # conflict only if both non-empty and different
                     if incoming.strip() != "" and existing.strip() != "" and incoming.strip() != existing.strip():
                         upsert_conflict(conn, key, loc, existing, "DB", incoming, src)
                         total_conflicts += 1
-
-        conn.commit()
 
     set_meta(conn, "bootstrapped_at", utc_now())
     set_meta(conn, "bootstrapped_by", who)
@@ -276,14 +296,16 @@ def df_to_xlsx_bytes(df: pd.DataFrame):
     return bio.getvalue()
 
 def keys_with_empty_en(conn):
-    df = pd.read_sql_query("""
+    df = df_from_query(conn, """
         SELECT e.key
         FROM entries e
         LEFT JOIN translations t
           ON e.key = t.key AND t.locale='en'
         WHERE COALESCE(TRIM(t.value), '') = ''
         ORDER BY e.key
-    """, conn)
+    """)
+    if df.empty:
+        return []
     return df["key"].tolist()
 
 # =========================================================
@@ -292,16 +314,17 @@ def keys_with_empty_en(conn):
 st.set_page_config(page_title="Locize Vault Tool", layout="wide")
 st.title("Locize Vault Tool (Default Non-Branded Vault)")
 
-st.sidebar.markdown("### Database")
-default_db = "locize_vault.sqlite"
-db_path = st.sidebar.text_input("DB file path", value=default_db)
-conn = get_conn(db_path)
+st.sidebar.markdown("### Database (Postgres)")
+conn = get_conn()
 init_db(conn)
 
-# DB health counters (critical for debugging)
-entry_count = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
-tr_count = conn.execute("SELECT COUNT(*) FROM translations").fetchone()[0]
-conf_count = conn.execute("SELECT COUNT(*) FROM conflicts WHERE resolved_value IS NULL").fetchone()[0]
+with conn.cursor() as cur:
+    cur.execute("SELECT COUNT(*) AS c FROM entries")
+    entry_count = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM translations")
+    tr_count = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM conflicts WHERE resolved_value IS NULL")
+    conf_count = cur.fetchone()["c"]
 st.sidebar.info(f"DB rows: entries={entry_count}, translations={tr_count}, open_conflicts={conf_count}")
 
 bootstrapped_at = get_meta(conn, "bootstrapped_at", "")
@@ -348,27 +371,55 @@ with tab_boot:
             st.success("Loaded 3 files from disk (saved in session).")
 
     st.markdown("---")
-    st.warning("This action will RESET the DB content in the selected sqlite file.")
+    st.warning("This action will RESET the DB content in Postgres.")
 
     if st.button("Build / Reset DB now"):
+    t0 = time.time()
+    status = st.status("Bootstrapping…", expanded=True)
+
+    try:
+        status.write("Step 1: DB ping")
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 AS ok;")
+            ok = cur.fetchone()["ok"]
+        status.write(f"DB ping ok: {ok} (t={time.time()-t0:.2f}s)")
+
+        status.write("Step 2: Read XLSX files")
         dfs = []
 
         if up_files and len(up_files) > 0:
             for f in up_files:
-                dfs.append((read_locize_xlsx(f.getvalue(), f.name), f.name))
+                status.write(f"Reading: {f.name}")
+                df = read_locize_xlsx(f.getvalue(), f.name)
+                status.write(f"  rows={len(df)} cols={len(df.columns)}")
+                dfs.append((df, f.name))
 
-        if st.session_state["disk_files"]:
+        if st.session_state.get("disk_files"):
             for n, b in st.session_state["disk_files"]:
-                dfs.append((read_locize_xlsx(b, n), n))
+                status.write(f"Reading: {n}")
+                df = read_locize_xlsx(b, n)
+                status.write(f"  rows={len(df)} cols={len(df.columns)}")
+                dfs.append((df, n))
 
         if len(dfs) == 0:
+            status.update(label="No files provided", state="error")
             st.error("No files provided. Upload the 3 XLSX or load from disk.")
-        else:
-            reset_db(conn)
-            stats = bootstrap_from_files(conn, dfs, who=who.strip() or "bootstrap")
-            st.success("Bootstrap complete.")
-            st.write(stats)
-            st.rerun()
+            st.stop()
+
+        status.write("Step 3: Reset DB (TRUNCATE)")
+        reset_db(conn)
+        status.write(f"Reset done (t={time.time()-t0:.2f}s)")
+
+        status.write("Step 4: Bootstrap merge/write")
+        stats = bootstrap_from_files(conn, dfs, who=who.strip() or "bootstrap")
+        status.write(stats)
+
+        status.update(label="Bootstrap complete ✅", state="complete")
+        st.rerun()
+
+    except Exception as e:
+        status.update(label="Bootstrap failed ❌", state="error")
+        st.exception(e)
 
 # -----------------------------
 # Missing EN
@@ -392,9 +443,9 @@ with tab_missing:
         current_en = get_translation(conn, pick_key, "en")
         new_en = st.text_area("EN value", value=current_en, height=120)
 
-        who = st.text_input("Edited by", value="web-content", key="missing_en_who")
+        who2 = st.text_input("Edited by", value="web-content", key="missing_en_who")
         if st.button("Save EN"):
-            set_translation(conn, pick_key, "en", new_en, who=who.strip() or "web-content")
+            set_translation(conn, pick_key, "en", new_en, who=who2.strip() or "web-content")
             st.success("Saved.")
             st.rerun()
 
@@ -428,10 +479,8 @@ with tab_conf:
             if not locales_for_key:
                 st.warning("Stale selection (no locales left for this key). Click refresh.")
                 if st.button("Refresh selection"):
-                    if "conf_pick_key" in st.session_state:
-                        del st.session_state["conf_pick_key"]
-                    if "conf_pick_locale" in st.session_state:
-                        del st.session_state["conf_pick_locale"]
+                    st.session_state.pop("conf_pick_key", None)
+                    st.session_state.pop("conf_pick_locale", None)
                     st.rerun()
             else:
                 if "conf_pick_locale" not in st.session_state or st.session_state["conf_pick_locale"] not in locales_for_key:
@@ -443,10 +492,8 @@ with tab_conf:
                 if match.empty:
                     st.warning("This conflict is already resolved or selection is stale. Click refresh.")
                     if st.button("Refresh selection", key="refresh2"):
-                        if "conf_pick_key" in st.session_state:
-                            del st.session_state["conf_pick_key"]
-                        if "conf_pick_locale" in st.session_state:
-                            del st.session_state["conf_pick_locale"]
+                        st.session_state.pop("conf_pick_key", None)
+                        st.session_state.pop("conf_pick_locale", None)
                         st.rerun()
                 else:
                     row = match.iloc[0]
@@ -458,18 +505,13 @@ with tab_conf:
                     st.write({"B source": b_src, "B value": b_val})
 
                     choice = st.radio("Choose base", options=["Use A", "Use B", "Custom"], index=0)
-                    if choice == "Use A":
-                        initial = a_val
-                    elif choice == "Use B":
-                        initial = b_val
-                    else:
-                        initial = ""
+                    initial = a_val if choice == "Use A" else b_val if choice == "Use B" else ""
 
                     final = st.text_area("Resolved value (editable)", value=initial, height=120)
-                    who = st.text_input("Resolved by", value="web-content", key="conf_who")
+                    who3 = st.text_input("Resolved by", value="web-content", key="conf_who")
 
                     if st.button("Save resolution"):
-                        resolve_conflict(conn, pick_key, pick_locale, final, who=who.strip() or "web-content")
+                        resolve_conflict(conn, pick_key, pick_locale, final, who=who3.strip() or "web-content")
                         st.success("Saved.")
                         st.rerun()
 
@@ -493,11 +535,11 @@ with tab_dict:
 
         st.markdown("#### Edit a locale")
         edit_locale = st.selectbox("Locale", options=LOCALES, key="dict_locale")
-        cur = get_translation(conn, selected_key, edit_locale)
-        new_val = st.text_area("Value", value=cur, height=120, key="dict_val")
-        who = st.text_input("Edited by", value="web-content", key="dict_who")
+        cur_val = get_translation(conn, selected_key, edit_locale)
+        new_val = st.text_area("Value", value=cur_val, height=120, key="dict_val")
+        who4 = st.text_input("Edited by", value="web-content", key="dict_who")
         if st.button("Save value"):
-            set_translation(conn, selected_key, edit_locale, new_val, who=who.strip() or "web-content")
+            set_translation(conn, selected_key, edit_locale, new_val, who=who4.strip() or "web-content")
             st.success("Saved.")
             st.rerun()
 
@@ -537,8 +579,8 @@ with tab_export:
             st.warning(f"There are {len(empty_en)} keys with empty EN. You can still export, but QA carefully.")
             st.dataframe(pd.DataFrame({"key": empty_en}).head(200), width="stretch")
 
-        conf = list_conflicts(conn)
-        open_conf = conf[conf["resolved_value"].isna()] if not conf.empty else conf
+        conf_df = list_conflicts(conn)
+        open_conf = conf_df[conf_df["resolved_value"].isna()] if not conf_df.empty else conf_df
         if not open_conf.empty:
             st.warning(f"There are {len(open_conf)} unresolved conflicts. Export will include current DB values.")
             st.dataframe(open_conf.head(50), width="stretch")
@@ -560,3 +602,6 @@ with tab_export:
             file_name=fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+
+
