@@ -39,16 +39,23 @@ def now_utc():
 def get_conn():
     db_url = st.secrets.get("DATABASE_URL") or os.getenv("DATABASE_URL")
     if not db_url:
-        raise RuntimeError("DATABASE_URL missing in Streamlit Secrets")
+        raise RuntimeError("DATABASE_URL missing in Streamlit Secrets (or env var)")
 
     conn = psycopg.connect(db_url, row_factory=dict_row)
     conn.autocommit = True
     return conn
 
-def df_from_query(conn, sql, params=()):
+def df_from_query(conn, sql, params=(), columns=None) -> pd.DataFrame:
+    """
+    Always returns a DataFrame with columns present.
+    This prevents KeyError when query returns 0 rows.
+    """
     with conn.cursor() as cur:
         cur.execute(sql, params)
-        rows = cur.fetchall()
+        rows = cur.fetchall()  # list[dict] due to dict_row
+
+    if not rows:
+        return pd.DataFrame(columns=columns or [])
     return pd.DataFrame(rows)
 
 def init_db(conn):
@@ -103,51 +110,82 @@ def set_meta(conn, k, v):
         """, (k, v))
 
 def get_meta(conn, k):
-    df = df_from_query(conn, "SELECT v FROM meta WHERE k=%s", (k,))
+    df = df_from_query(conn, "SELECT v FROM meta WHERE k=%s", (k,), columns=["v"])
     return df.iloc[0]["v"] if not df.empty else ""
 
 
 # =========================================================
 # XLSX + BULK BOOTSTRAP (ADMIN ONLY)
 # =========================================================
-def read_locize_xlsx(file_bytes):
+def read_locize_xlsx(file_bytes: bytes, source_name: str):
     df = pd.read_excel(io.BytesIO(file_bytes), dtype=str).fillna("")
     if "key" not in df.columns:
-        raise ValueError("Missing column: key")
+        raise ValueError(f"{source_name}: Missing required column 'key'")
 
+    # Locize structure fields must exist (even if empty)
     for h in EXPECTED_HEADERS:
         if h not in df.columns:
             df[h] = ""
 
+    # Maintain exact order (and ignore extra columns)
     df = df[EXPECTED_HEADERS]
-    df["key"] = df["key"].str.strip()
-    return df[df["key"] != ""]
 
-def bulk_bootstrap(conn, dfs, who):
+    # Normalize
+    df["key"] = df["key"].astype(str).str.strip()
+    df["namespace"] = "translation"
+
+    # Keep only rows with key
+    df = df[df["key"] != ""]
+    return df
+
+def bulk_bootstrap(conn, dfs_with_source, who: str):
+    """
+    Fast import:
+    - Truncates all tables (admin action)
+    - Merges rows by key (later file wins if duplicates)
+    - Bulk inserts entries + translations
+    """
     t0 = time.time()
-
     merged = {}
-    for df in dfs:
+
+    for df, src in dfs_with_source:
         for _, row in df.iterrows():
-            merged[row["key"]] = row
+            k = str(row["key"]).strip()
+            if not k:
+                continue
+            merged[k] = row
 
     keys = list(merged.keys())
     now = now_utc()
 
-    entries = []
-    translations = []
+    entry_rows = []
+    tr_rows = []
 
-    for k, r in merged.items():
-        entries.append((k, r["tags"], r["context"], r["maxCharacters"], "translation", now))
+    for k in keys:
+        r = merged[k]
+        entry_rows.append((
+            k,
+            str(r.get("tags", "") or ""),
+            str(r.get("context", "") or ""),
+            str(r.get("maxCharacters", "") or ""),
+            "translation",
+            now
+        ))
         for loc in LOCALES:
-            translations.append((k, loc, r.get(loc, ""), now, who))
+            tr_rows.append((
+                k,
+                loc,
+                str(r.get(loc, "") or ""),
+                now,
+                who
+            ))
 
     with conn.cursor() as cur:
         cur.executemany("""
             INSERT INTO entries(key, tags, context, maxCharacters, namespace, created_at)
             VALUES (%s,%s,%s,%s,%s,%s)
             ON CONFLICT(key) DO NOTHING
-        """, entries)
+        """, entry_rows)
 
         cur.executemany("""
             INSERT INTO translations(key, locale, value, updated_at, updated_by)
@@ -156,20 +194,23 @@ def bulk_bootstrap(conn, dfs, who):
               value=EXCLUDED.value,
               updated_at=EXCLUDED.updated_at,
               updated_by=EXCLUDED.updated_by
-        """, translations)
+        """, tr_rows)
+
+        # Conflicts cleared (DB is fresh)
+        cur.execute("TRUNCATE TABLE conflicts;")
 
     set_meta(conn, "bootstrapped_at", now.isoformat())
     set_meta(conn, "bootstrapped_by", who)
 
     return {
-        "keys": len(entries),
-        "translations": len(translations),
+        "keys_inserted": len(keys),
+        "translations_written": len(tr_rows),
         "seconds": round(time.time() - t0, 2)
     }
 
 
 # =========================================================
-# App UI
+# UI
 # =========================================================
 st.set_page_config(page_title="Locize Vault Tool", layout="wide")
 st.title("Locize Vault Tool (Permanent Vault)")
@@ -177,13 +218,13 @@ st.title("Locize Vault Tool (Permanent Vault)")
 conn = get_conn()
 init_db(conn)
 
-# --- Sidebar DB state
+# Sidebar DB state
 counts = df_from_query(conn, """
     SELECT
-      (SELECT COUNT(*) FROM entries) AS entries,
-      (SELECT COUNT(*) FROM translations) AS translations,
-      (SELECT COUNT(*) FROM conflicts WHERE resolved_value IS NULL) AS open_conflicts
-""").iloc[0]
+      (SELECT COUNT(*)::int FROM entries) AS entries,
+      (SELECT COUNT(*)::int FROM translations) AS translations,
+      (SELECT COUNT(*)::int FROM conflicts WHERE resolved_value IS NULL) AS open_conflicts
+""", columns=["entries", "translations", "open_conflicts"]).iloc[0]
 
 st.sidebar.markdown("### Database (Postgres)")
 st.sidebar.info(
@@ -197,13 +238,14 @@ if counts["entries"] == 0:
 else:
     st.sidebar.success("DB ready ✓")
 
-# --- Admin mode
-is_admin = st.sidebar.checkbox("Admin mode")
+# Admin mode (password stored in Streamlit Secrets)
+is_admin_ui = st.sidebar.checkbox("Admin mode")
 ADMIN_PW = st.secrets.get("ADMIN_PASSWORD", "")
 
-if is_admin:
+is_admin = False
+if is_admin_ui:
     pw = st.sidebar.text_input("Admin password", type="password")
-    is_admin = pw == ADMIN_PW
+    is_admin = (pw == ADMIN_PW) and bool(ADMIN_PW)
 
 tabs = ["Dictionary", "Missing EN", "Conflicts", "Export"]
 if is_admin:
@@ -211,13 +253,12 @@ if is_admin:
 
 tab_objs = st.tabs(tabs)
 
-
-# =========================================================
-# ADMIN IMPORT
-# =========================================================
+# -----------------------------
+# Admin Import
+# -----------------------------
 if is_admin:
     with tab_objs[0]:
-        st.subheader("Admin: One-time Import / Rebuild DB")
+        st.subheader("Admin: Import / Rebuild DB")
 
         files = st.file_uploader("Upload XLSX files", type=["xlsx"], accept_multiple_files=True)
         who = st.text_input("Imported by", value="admin")
@@ -231,70 +272,176 @@ if is_admin:
 
             status = st.status("Importing…", expanded=True)
             try:
-                dfs = [read_locize_xlsx(f.getvalue()) for f in files]
-                status.write("Truncating DB")
+                status.write("Reading XLSX…")
+                dfs = [(read_locize_xlsx(f.getvalue(), f.name), f.name) for f in files]
+                for df, src in dfs:
+                    status.write(f"{src}: rows={len(df)} unique_keys={df['key'].nunique()}")
+
+                status.write("Truncating DB…")
                 truncate_all(conn)
-                status.write("Bulk inserting")
-                stats = bulk_bootstrap(conn, dfs, who)
+
+                status.write("Bulk inserting…")
+                stats = bulk_bootstrap(conn, dfs, who.strip() or "admin")
                 status.write(stats)
+
                 status.update(label="Import complete ✓", state="complete")
                 st.rerun()
             except Exception as e:
                 status.update(label="Import failed", state="error")
                 st.exception(e)
 
-
-# =========================================================
-# DICTIONARY
-# =========================================================
-with tab_objs[-4 if is_admin else 0]:
-    st.subheader("Dictionary")
-    keys = df_from_query(conn, "SELECT key FROM entries ORDER BY key")
-    if keys.empty:
-        st.info("No keys yet.")
+# Helper: pick the correct tab indexes depending on admin
+def tab_index(name: str) -> int:
+    # if admin, "Admin Import" shifts everything by +1
+    if is_admin:
+        mapping = {
+            "Dictionary": 1,
+            "Missing EN": 2,
+            "Conflicts": 3,
+            "Export": 4
+        }
     else:
-        selected = st.selectbox("Key", keys["key"].tolist())
-        for loc in LOCALES:
-            val = df_from_query(
-                conn,
-                "SELECT value FROM translations WHERE key=%s AND locale=%s",
-                (selected, loc)
-            )
-            new = st.text_area(loc, value=val.iloc[0]["value"] if not val.empty else "")
-            if st.button(f"Save {loc}"):
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO translations(key, locale, value, updated_at)
-                        VALUES (%s,%s,%s,%s)
-                        ON CONFLICT(key, locale) DO UPDATE SET
-                          value=EXCLUDED.value,
-                          updated_at=EXCLUDED.updated_at
-                    """, (selected, loc, new, now_utc()))
-                st.success("Saved")
-                st.rerun()
+        mapping = {
+            "Dictionary": 0,
+            "Missing EN": 1,
+            "Conflicts": 2,
+            "Export": 3
+        }
+    return mapping[name]
 
+# -----------------------------
+# Dictionary
+# -----------------------------
+with tab_objs[tab_index("Dictionary")]:
+    st.subheader("Dictionary")
 
-# =========================================================
-# EXPORT
-# =========================================================
-with tab_objs[-1]:
-    st.subheader("Export")
+    keys_df = df_from_query(conn, "SELECT key FROM entries ORDER BY key", columns=["key"])
+    if keys_df.empty:
+        st.info("No keys yet. Ask an admin to import once.")
+        st.stop()
+
+    selected = st.selectbox("Key", keys_df["key"].tolist())
+
+    # show values
+    tr_df = df_from_query(conn,
+        "SELECT locale, value FROM translations WHERE key=%s ORDER BY locale",
+        (selected,),
+        columns=["locale", "value"]
+    )
+
+    st.dataframe(tr_df, width="stretch", height=420)
+
+    st.markdown("#### Edit a locale")
+    edit_locale = st.selectbox("Locale", options=LOCALES)
+    current_val = tr_df[tr_df["locale"] == edit_locale]["value"].iloc[0] if not tr_df[tr_df["locale"] == edit_locale].empty else ""
+    new_val = st.text_area("Value", value=current_val, height=120)
+    edited_by = st.text_input("Edited by", value="web-content")
+
+    if st.button("Save"):
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO translations(key, locale, value, updated_at, updated_by)
+                VALUES (%s,%s,%s,%s,%s)
+                ON CONFLICT(key, locale) DO UPDATE SET
+                  value=EXCLUDED.value,
+                  updated_at=EXCLUDED.updated_at,
+                  updated_by=EXCLUDED.updated_by
+            """, (selected, edit_locale, new_val, now_utc(), edited_by.strip() or "web-content"))
+        st.success("Saved.")
+        st.rerun()
+
+# -----------------------------
+# Missing EN
+# -----------------------------
+with tab_objs[tab_index("Missing EN")]:
+    st.subheader("Missing EN")
+    df_missing = df_from_query(conn, """
+        SELECT e.key
+        FROM entries e
+        LEFT JOIN translations t
+          ON e.key = t.key AND t.locale='en'
+        WHERE COALESCE(TRIM(t.value), '') = ''
+        ORDER BY e.key
+    """, columns=["key"])
+
+    if df_missing.empty:
+        st.info("No missing EN values.")
+        st.stop()
+
+    st.write(f"Keys with empty EN: {len(df_missing)}")
+    pick_key = st.selectbox("Pick key", df_missing["key"].tolist()[:2000])
+
+    cur_en = df_from_query(conn,
+        "SELECT value FROM translations WHERE key=%s AND locale='en'",
+        (pick_key,),
+        columns=["value"]
+    )
+    cur_val = cur_en.iloc[0]["value"] if not cur_en.empty else ""
+    new_val = st.text_area("EN value", value=cur_val, height=120)
+    edited_by = st.text_input("Edited by", value="web-content", key="missing_en_by")
+
+    if st.button("Save EN"):
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO translations(key, locale, value, updated_at, updated_by)
+                VALUES (%s,'en',%s,%s,%s)
+                ON CONFLICT(key, locale) DO UPDATE SET
+                  value=EXCLUDED.value,
+                  updated_at=EXCLUDED.updated_at,
+                  updated_by=EXCLUDED.updated_by
+            """, (pick_key, new_val, now_utc(), edited_by.strip() or "web-content"))
+        st.success("Saved.")
+        st.rerun()
+
+# -----------------------------
+# Conflicts (kept for future)
+# -----------------------------
+with tab_objs[tab_index("Conflicts")]:
+    st.subheader("Conflicts")
+    conf_df = df_from_query(conn, """
+        SELECT key, locale, a_source, a_value, b_source, b_value, resolved_value
+        FROM conflicts
+        ORDER BY key, locale
+    """, columns=["key", "locale", "a_source", "a_value", "b_source", "b_value", "resolved_value"])
+
+    if conf_df.empty:
+        st.info("No conflicts.")
+        st.stop()
+
+    st.dataframe(conf_df, width="stretch", height=520)
+
+# -----------------------------
+# Export
+# -----------------------------
+with tab_objs[tab_index("Export")]:
+    st.subheader("Export Locize-ready XLSX")
+
     locales = st.multiselect("Locales", LOCALES, default=["en"])
+    if "en" not in locales:
+        locales = ["en"] + locales
+
+    # Pull values
     df = df_from_query(conn, """
         SELECT e.key, t.locale, t.value
         FROM entries e
         JOIN translations t ON e.key = t.key
-    """)
+    """, columns=["key", "locale", "value"])
+
+    # Guard: empty DB
+    if df.empty or "key" not in df.columns:
+        st.info("No data to export yet. Ask an admin to import once.")
+        st.stop()
 
     rows = []
     for k in df["key"].unique():
         r = {"key": k, "tags": "", "context": "", "maxCharacters": "", "namespace": "translation"}
         for loc in locales:
-            v = df[(df.key == k) & (df.locale == loc)]
+            v = df[(df["key"] == k) & (df["locale"] == loc)]
             r[loc] = v.iloc[0]["value"] if not v.empty else ""
         rows.append(r)
 
     out = pd.DataFrame(rows)[BASE_COLS + locales]
+
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as w:
         out.to_excel(w, index=False)
@@ -303,5 +450,6 @@ with tab_objs[-1]:
     st.download_button(
         "Download XLSX",
         data=bio.getvalue(),
-        file_name="locize_export.xlsx"
+        file_name="locize_export.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
