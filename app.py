@@ -496,6 +496,93 @@ with tab_objs[tab_index("Export")]:
         st.info("No data to export yet. Ask an admin to import once.")
         st.stop()
 
+        with tab_objs[tab_index("Export")]:
+            st.subheader("Export Locize-ready XLSX")
+
+    locales = st.multiselect("Locales", LOCALES, default=["en"])
+    if "en" not in locales:
+        locales = ["en"] + locales
+
+    # --- Export options ---
+    st.markdown("### Export options")
+
+    fill_missing_from_en = st.checkbox("Fill missing locales from EN", value=False)
+
+    st.markdown("### String replacements (applied on export)")
+    brand_value = st.text_input("Replace BRAND with", value="")
+    support_email_value = st.text_input("Replace support@BRAND with", value="")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        ph1 = st.text_input("Custom placeholder #1", value="")
+        ph2 = st.text_input("Custom placeholder #2", value="")
+        ph3 = st.text_input("Custom placeholder #3", value="")
+    with col2:
+        val1 = st.text_input("Replacement #1", value="")
+        val2 = st.text_input("Replacement #2", value="")
+        val3 = st.text_input("Replacement #3", value="")
+
+    repl_pairs = []
+    if brand_value:
+        repl_pairs.append(("BRAND", brand_value))
+    if support_email_value:
+        repl_pairs.append(("support@BRAND", support_email_value))
+
+    for ph, vv in [(ph1, val1), (ph2, val2), (ph3, val3)]:
+        if ph:
+            repl_pairs.append((ph, vv or ""))
+
+    # Pull values
+    df = df_from_query(conn, """
+        SELECT e.key, t.locale, t.value
+        FROM entries e
+        JOIN translations t ON e.key = t.key
+    """, columns=["key", "locale", "value"])
+
+    if df.empty or "key" not in df.columns:
+        st.info("No data to export yet. Ask an admin to import once.")
+        st.stop()
+
+    rows = []
+    for k in df["key"].unique():
+        r = {"key": k, "tags": "", "context": "", "maxCharacters": "", "namespace": "translation"}
+
+        # EN value for fallback
+        en_v = df[(df["key"] == k) & (df["locale"] == "en")]
+        en_val = en_v.iloc[0]["value"] if not en_v.empty else ""
+
+        for loc in locales:
+            v = df[(df["key"] == k) & (df["locale"] == loc)]
+            cell = v.iloc[0]["value"] if not v.empty else ""
+
+            if fill_missing_from_en and (cell.strip() == "") and loc != "en":
+                cell = en_val
+
+            # apply replacements (only if non-empty)
+            if cell and repl_pairs:
+                for src, dst in repl_pairs:
+                    cell = cell.replace(src, dst)
+
+            r[loc] = cell
+
+        rows.append(r)
+
+    out = pd.DataFrame(rows)[BASE_COLS + locales]
+
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as w:
+        out.to_excel(w, index=False)
+    bio.seek(0)
+
+    st.download_button(
+        "Download XLSX",
+        data=bio.getvalue(),
+        file_name="locize_export.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_export_xlsx"
+    )
+
+
     rows = []
     for k in df["key"].unique():
         r = {"key": k, "tags": "", "context": "", "maxCharacters": "", "namespace": "translation"}
