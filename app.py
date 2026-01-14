@@ -315,9 +315,73 @@ def tab_index(name: str) -> int:
 with tab_objs[tab_index("Dictionary")]:
     st.subheader("Dictionary")
 
+    # ---- Create New Key (Beta requirement) ----
+    with st.expander("➕ Create New Key", expanded=False):
+        with st.form("create_new_key_form", clear_on_submit=False):
+            new_key = st.text_input("Key (required, unique)", value="").strip()
+            created_by = st.text_input("Created by", value="web-content").strip() or "web-content"
+            copy_en_all = st.checkbox("After creation: copy EN → all locales", value=False)
+            initial_en = st.text_area("Initial EN value (optional)", value="", height=100)
+
+            submitted = st.form_submit_button("Create key")
+
+        if submitted:
+            if not new_key:
+                st.error("Key is required.")
+            else:
+                # uniqueness check
+                exists_df = df_from_query(
+                    conn,
+                    "SELECT 1 AS exists FROM entries WHERE key=%s",
+                    (new_key,),
+                    columns=["exists"]
+                )
+                if not exists_df.empty:
+                    st.error(f"Key already exists: {new_key}")
+                else:
+                    now = now_utc()
+                    try:
+                        with conn.cursor() as cur:
+                            # create entry
+                            cur.execute("""
+                                INSERT INTO entries(key, tags, context, maxCharacters, namespace, created_at)
+                                VALUES (%s, '', '', '', 'translation', %s)
+                            """, (new_key, now))
+
+                            # create translations (empty by default)
+                            tr_rows = []
+                            for loc in LOCALES:
+                                val = ""
+                                if loc == "en" and initial_en is not None:
+                                    val = initial_en
+                                tr_rows.append((new_key, loc, val, now, created_by))
+
+                            cur.executemany("""
+                                INSERT INTO translations(key, locale, value, updated_at, updated_by)
+                                VALUES (%s,%s,%s,%s,%s)
+                                ON CONFLICT(key, locale) DO NOTHING
+                            """, tr_rows)
+
+                            # optional: copy EN to all locales (only if EN non-empty)
+                            if copy_en_all and (initial_en or "").strip():
+                                cur.executemany("""
+                                    UPDATE translations
+                                    SET value=%s, updated_at=%s, updated_by=%s
+                                    WHERE key=%s AND locale=%s
+                                """, [
+                                    (initial_en, now, created_by, new_key, loc)
+                                    for loc in LOCALES if loc != "en"
+                                ])
+
+                        st.success(f"Created key: {new_key}")
+                        st.rerun()
+                    except Exception as e:
+                        st.exception(e)
+
+    # ---- Existing Dictionary view/edit ----
     keys_df = df_from_query(conn, "SELECT key FROM entries ORDER BY key", columns=["key"])
     if keys_df.empty:
-        st.info("No keys yet. Ask an admin to import once.")
+        st.info("No keys yet. Create one above (or ask an admin to import).")
         st.stop()
 
     selected = st.selectbox("Key", keys_df["key"].tolist())
@@ -349,6 +413,7 @@ with tab_objs[tab_index("Dictionary")]:
             """, (selected, edit_locale, new_val, now_utc(), edited_by.strip() or "web-content"))
         st.success("Saved.")
         st.rerun()
+
 
 # -----------------------------
 # Missing EN
