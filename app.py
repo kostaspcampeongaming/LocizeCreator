@@ -429,9 +429,10 @@ with tab_objs[tab_index("Missing EN")]:
         ORDER BY e.key
     """, columns=["key"])
 
-    if df_missing.empty:
-        st.info("No missing EN values.")
-        st.stop()
+if df_missing.empty:
+    st.info("No missing EN values.")
+else:
+    # existing editor UI...
 
     st.write(f"Keys with empty EN: {len(df_missing)}")
     pick_key = st.selectbox("Pick key", df_missing["key"].tolist()[:2000])
@@ -469,12 +470,10 @@ with tab_objs[tab_index("Conflicts")]:
         ORDER BY key, locale
     """, columns=["key", "locale", "a_source", "a_value", "b_source", "b_value", "resolved_value"])
 
-    if conf_df.empty:
-        st.info("No conflicts.")
-        st.stop()
-
+if conf_df.empty:
+    st.info("No conflicts.")
+else:
     st.dataframe(conf_df, width="stretch", height=520)
-
 # -----------------------------
 # Export
 # -----------------------------
