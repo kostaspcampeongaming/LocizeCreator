@@ -315,73 +315,9 @@ def tab_index(name: str) -> int:
 with tab_objs[tab_index("Dictionary")]:
     st.subheader("Dictionary")
 
-    # ---- Create New Key (Beta requirement) ----
-    with st.expander("➕ Create New Key", expanded=False):
-        with st.form("create_new_key_form", clear_on_submit=False):
-            new_key = st.text_input("Key (required, unique)", value="").strip()
-            created_by = st.text_input("Created by", value="web-content").strip() or "web-content"
-            copy_en_all = st.checkbox("After creation: copy EN → all locales", value=False)
-            initial_en = st.text_area("Initial EN value (optional)", value="", height=100)
-
-            submitted = st.form_submit_button("Create key")
-
-        if submitted:
-            if not new_key:
-                st.error("Key is required.")
-            else:
-                # uniqueness check
-                exists_df = df_from_query(
-                    conn,
-                    "SELECT 1 AS exists FROM entries WHERE key=%s",
-                    (new_key,),
-                    columns=["exists"]
-                )
-                if not exists_df.empty:
-                    st.error(f"Key already exists: {new_key}")
-                else:
-                    now = now_utc()
-                    try:
-                        with conn.cursor() as cur:
-                            # create entry
-                            cur.execute("""
-                                INSERT INTO entries(key, tags, context, maxCharacters, namespace, created_at)
-                                VALUES (%s, '', '', '', 'translation', %s)
-                            """, (new_key, now))
-
-                            # create translations (empty by default)
-                            tr_rows = []
-                            for loc in LOCALES:
-                                val = ""
-                                if loc == "en" and initial_en is not None:
-                                    val = initial_en
-                                tr_rows.append((new_key, loc, val, now, created_by))
-
-                            cur.executemany("""
-                                INSERT INTO translations(key, locale, value, updated_at, updated_by)
-                                VALUES (%s,%s,%s,%s,%s)
-                                ON CONFLICT(key, locale) DO NOTHING
-                            """, tr_rows)
-
-                            # optional: copy EN to all locales (only if EN non-empty)
-                            if copy_en_all and (initial_en or "").strip():
-                                cur.executemany("""
-                                    UPDATE translations
-                                    SET value=%s, updated_at=%s, updated_by=%s
-                                    WHERE key=%s AND locale=%s
-                                """, [
-                                    (initial_en, now, created_by, new_key, loc)
-                                    for loc in LOCALES if loc != "en"
-                                ])
-
-                        st.success(f"Created key: {new_key}")
-                        st.rerun()
-                    except Exception as e:
-                        st.exception(e)
-
-    # ---- Existing Dictionary view/edit ----
     keys_df = df_from_query(conn, "SELECT key FROM entries ORDER BY key", columns=["key"])
     if keys_df.empty:
-        st.info("No keys yet. Create one above (or ask an admin to import).")
+        st.info("No keys yet. Ask an admin to import once.")
         st.stop()
 
     selected = st.selectbox("Key", keys_df["key"].tolist())
@@ -414,12 +350,12 @@ with tab_objs[tab_index("Dictionary")]:
         st.success("Saved.")
         st.rerun()
 
-
 # -----------------------------
 # Missing EN
 # -----------------------------
 with tab_objs[tab_index("Missing EN")]:
     st.subheader("Missing EN")
+
     df_missing = df_from_query(conn, """
         SELECT e.key
         FROM entries e
@@ -429,98 +365,79 @@ with tab_objs[tab_index("Missing EN")]:
         ORDER BY e.key
     """, columns=["key"])
 
-if df_missing.empty:
-    st.info("No missing EN values.")
-else:
-    # existing editor UI...
+    if df_missing.empty:
+        st.info("No missing EN values.")
+    else:
+        st.write(f"Keys with empty EN: {len(df_missing)}")
+        pick_key = st.selectbox("Pick key", df_missing["key"].tolist()[:2000], key="missing_pick_key")
 
-    st.write(f"Keys with empty EN: {len(df_missing)}")
-    pick_key = st.selectbox("Pick key", df_missing["key"].tolist()[:2000])
+        cur_en = df_from_query(
+            conn,
+            "SELECT value FROM translations WHERE key=%s AND locale='en'",
+            (pick_key,),
+            columns=["value"],
+        )
+        cur_val = cur_en.iloc[0]["value"] if not cur_en.empty else ""
+        new_val = st.text_area("EN value", value=cur_val, height=120, key="missing_en_value")
+        edited_by = st.text_input("Edited by", value="web-content", key="missing_en_by")
 
-    cur_en = df_from_query(conn,
-        "SELECT value FROM translations WHERE key=%s AND locale='en'",
-        (pick_key,),
-        columns=["value"]
-    )
-    cur_val = cur_en.iloc[0]["value"] if not cur_en.empty else ""
-    new_val = st.text_area("EN value", value=cur_val, height=120)
-    edited_by = st.text_input("Edited by", value="web-content", key="missing_en_by")
-
-    if st.button("Save EN"):
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO translations(key, locale, value, updated_at, updated_by)
-                VALUES (%s,'en',%s,%s,%s)
-                ON CONFLICT(key, locale) DO UPDATE SET
-                  value=EXCLUDED.value,
-                  updated_at=EXCLUDED.updated_at,
-                  updated_by=EXCLUDED.updated_by
-            """, (pick_key, new_val, now_utc(), edited_by.strip() or "web-content"))
-        st.success("Saved.")
-        st.rerun()
+        if st.button("Save EN", key="missing_en_save"):
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO translations(key, locale, value, updated_at, updated_by)
+                    VALUES (%s,'en',%s,%s,%s)
+                    ON CONFLICT(key, locale) DO UPDATE SET
+                      value=EXCLUDED.value,
+                      updated_at=EXCLUDED.updated_at,
+                      updated_by=EXCLUDED.updated_by
+                """, (pick_key, new_val, now_utc(), edited_by.strip() or "web-content"))
+            st.success("Saved.")
+            st.rerun()
 
 # -----------------------------
 # Conflicts (kept for future)
 # -----------------------------
 with tab_objs[tab_index("Conflicts")]:
     st.subheader("Conflicts")
+
     conf_df = df_from_query(conn, """
         SELECT key, locale, a_source, a_value, b_source, b_value, resolved_value
         FROM conflicts
         ORDER BY key, locale
     """, columns=["key", "locale", "a_source", "a_value", "b_source", "b_value", "resolved_value"])
 
-if conf_df.empty:
-    st.info("No conflicts.")
-else:
-    st.dataframe(conf_df, width="stretch", height=520)
+    if conf_df.empty:
+        st.info("No conflicts.")
+    else:
+        st.dataframe(conf_df, width="stretch", height=520)
+
 # -----------------------------
 # Export
 # -----------------------------
 with tab_objs[tab_index("Export")]:
     st.subheader("Export Locize-ready XLSX")
 
-    locales = st.multiselect("Locales", LOCALES, default=["en"])
-    if "en" not in locales:
-        locales = ["en"] + locales
-
-    # Pull values
-    df = df_from_query(conn, """
-        SELECT e.key, t.locale, t.value
-        FROM entries e
-        JOIN translations t ON e.key = t.key
-    """, columns=["key", "locale", "value"])
-
-    # Guard: empty DB
-    if df.empty or "key" not in df.columns:
-        st.info("No data to export yet. Ask an admin to import once.")
-        st.stop()
-
-        with tab_objs[tab_index("Export")]:
-            st.subheader("Export Locize-ready XLSX")
-
-    locales = st.multiselect("Locales", LOCALES, default=["en"])
+    locales = st.multiselect("Locales", LOCALES, default=["en"], key="export_locales")
     if "en" not in locales:
         locales = ["en"] + locales
 
     # --- Export options ---
     st.markdown("### Export options")
-
-    fill_missing_from_en = st.checkbox("Fill missing locales from EN", value=False)
+    fill_missing_from_en = st.checkbox("Fill missing locales from EN", value=False, key="export_fill_missing")
 
     st.markdown("### String replacements (applied on export)")
-    brand_value = st.text_input("Replace BRAND with", value="")
-    support_email_value = st.text_input("Replace support@BRAND with", value="")
+    brand_value = st.text_input("Replace BRAND with", value="", key="export_brand")
+    support_email_value = st.text_input("Replace support@BRAND with", value="", key="export_support_brand")
 
     col1, col2 = st.columns(2)
     with col1:
-        ph1 = st.text_input("Custom placeholder #1", value="")
-        ph2 = st.text_input("Custom placeholder #2", value="")
-        ph3 = st.text_input("Custom placeholder #3", value="")
+        ph1 = st.text_input("Custom placeholder #1", value="", key="export_ph1")
+        ph2 = st.text_input("Custom placeholder #2", value="", key="export_ph2")
+        ph3 = st.text_input("Custom placeholder #3", value="", key="export_ph3")
     with col2:
-        val1 = st.text_input("Replacement #1", value="")
-        val2 = st.text_input("Replacement #2", value="")
-        val3 = st.text_input("Replacement #3", value="")
+        val1 = st.text_input("Replacement #1", value="", key="export_val1")
+        val2 = st.text_input("Replacement #2", value="", key="export_val2")
+        val3 = st.text_input("Replacement #3", value="", key="export_val3")
 
     repl_pairs = []
     if brand_value:
@@ -539,12 +456,15 @@ with tab_objs[tab_index("Export")]:
         JOIN translations t ON e.key = t.key
     """, columns=["key", "locale", "value"])
 
+    # Guard: empty DB
     if df.empty or "key" not in df.columns:
         st.info("No data to export yet. Ask an admin to import once.")
         st.stop()
 
     rows = []
-    for k in df["key"].unique():
+    unique_keys = df["key"].unique().tolist()
+
+    for k in unique_keys:
         r = {"key": k, "tags": "", "context": "", "maxCharacters": "", "namespace": "translation"}
 
         # EN value for fallback
@@ -558,7 +478,7 @@ with tab_objs[tab_index("Export")]:
             if fill_missing_from_en and (cell.strip() == "") and loc != "en":
                 cell = en_val
 
-            # apply replacements (only if non-empty)
+            # Apply replacements only to non-empty strings (keeps empty cells empty)
             if cell and repl_pairs:
                 for src, dst in repl_pairs:
                     cell = cell.replace(src, dst)
@@ -579,28 +499,6 @@ with tab_objs[tab_index("Export")]:
         data=bio.getvalue(),
         file_name="locize_export.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="download_export_xlsx"
+        key="download_export_xlsx",
     )
 
-
-    rows = []
-    for k in df["key"].unique():
-        r = {"key": k, "tags": "", "context": "", "maxCharacters": "", "namespace": "translation"}
-        for loc in locales:
-            v = df[(df["key"] == k) & (df["locale"] == loc)]
-            r[loc] = v.iloc[0]["value"] if not v.empty else ""
-        rows.append(r)
-
-    out = pd.DataFrame(rows)[BASE_COLS + locales]
-
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as w:
-        out.to_excel(w, index=False)
-    bio.seek(0)
-
-    st.download_button(
-        "Download XLSX",
-        data=bio.getvalue(),
-        file_name="locize_export.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
